@@ -5,11 +5,16 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.imageio.ImageIO;
 
@@ -22,28 +27,63 @@ import javax.imageio.ImageIO;
 public class ImageRestorationServer {
 
     private static final int MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-    private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
     // Identificador sequencial para correlacionar as linhas de log de uma mesma requisição
     private static final AtomicLong requestCounter = new AtomicLong();
 
+    // Momento em que a requisição entrou na fila do pool, para medir o tempo de espera
+    private static final ThreadLocal<Long> enqueuedAt = new ThreadLocal<>();
+
+    private static final ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
+
+    private static Metrics metrics;
+
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(env("PORT", "8080"));
         int threads = Integer.parseInt(env("THREADS", String.valueOf(Runtime.getRuntime().availableProcessors())));
+        int metricsIntervalS = Integer.parseInt(env("METRICS_INTERVAL_S", "5"));
+
+        AtomicInteger workerId = new AtomicInteger();
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(threads, threads, 0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(), r -> new Thread(r, "worker-" + workerId.incrementAndGet()));
+        metrics = new Metrics(pool);
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/restore", ImageRestorationServer::handleRestore);
-        server.setExecutor(Executors.newFixedThreadPool(threads));
+        server.setExecutor(task -> {
+            long queuedAt = System.nanoTime();
+            pool.execute(() -> {
+                enqueuedAt.set(queuedAt);
+                task.run();
+            });
+        });
         server.start();
 
-        log("INFO", "servidor iniciado porta=%d threads=%d cpus=%d max_heap_mb=%d",
+        if (metricsIntervalS > 0) {
+            ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "metrics");
+                t.setDaemon(true);
+                return t;
+            });
+            scheduler.scheduleAtFixedRate(metrics::logInterval, metricsIntervalS, metricsIntervalS, TimeUnit.SECONDS);
+        }
+        Runtime.getRuntime().addShutdownHook(new Thread(metrics::logSummary, "shutdown"));
+
+        Log.info("servidor iniciado porta=%d threads=%d cpus=%d max_heap_mb=%d metricas_intervalo_s=%d "
+                        + "cpu_time_suportado=%b java=%s",
                 port, threads, Runtime.getRuntime().availableProcessors(),
-                Runtime.getRuntime().maxMemory() / (1024 * 1024));
+                Runtime.getRuntime().maxMemory() / (1024 * 1024), metricsIntervalS,
+                threadBean.isCurrentThreadCpuTimeSupported(), System.getProperty("java.version"));
     }
 
     private static void handleRestore(HttpExchange exchange) throws IOException {
         long id = requestCounter.incrementAndGet();
         long start = System.nanoTime();
+        long cpuStart = threadBean.getCurrentThreadCpuTime();
+        Long queuedAt = enqueuedAt.get();
+        long queueMs = queuedAt == null ? 0 : (start - queuedAt) / 1_000_000;
+        int inFlight = metrics.requestStarted();
+        int queueSize = metrics.queueSize();
         String method = exchange.getRequestMethod();
         String client = exchange.getRemoteAddress().getAddress().getHostAddress();
 
@@ -72,7 +112,9 @@ public class ImageRestorationServer {
             }
 
             t0 = System.nanoTime();
+            long restoreCpuStart = threadBean.getCurrentThreadCpuTime();
             BufferedImage output = Deconvolution.restore(input);
+            long restoreCpuMs = (threadBean.getCurrentThreadCpuTime() - restoreCpuStart) / 1_000_000;
             long restoreMs = elapsedMs(t0);
 
             t0 = System.nanoTime();
@@ -84,12 +126,22 @@ public class ImageRestorationServer {
             exchange.getResponseHeaders().set("X-Processing-Time-Ms", String.valueOf(totalMs));
             send(exchange, 200, "image/png", png.toByteArray());
 
-            log("INFO", "req=%d %s /restore client=%s status=200 img=%dx%d in_bytes=%d out_bytes=%d "
-                            + "decode_ms=%d restore_ms=%d encode_ms=%d total_ms=%d",
-                    id, method, client, input.getWidth(), input.getHeight(), body.length, png.size(),
-                    decodeMs, restoreMs, encodeMs, totalMs);
+            long cpuMs = (threadBean.getCurrentThreadCpuTime() - cpuStart) / 1_000_000;
+            long latencyMs = queueMs + elapsedMs(start);
+            long pixels = (long) input.getWidth() * input.getHeight();
+            metrics.requestSucceeded(new Metrics.Sample(latencyMs, queueMs, cpuMs));
+
+            // cpu_ratio = CPU da thread / tempo de relógio no algoritmo; abaixo de 1 indica disputa por núcleos
+            Log.info("req=%d %s /restore client=%s status=200 img=%dx%d pixels=%d in_bytes=%d out_bytes=%d "
+                            + "em_andamento=%d fila=%d queue_ms=%d decode_ms=%d restore_ms=%d restore_cpu_ms=%d "
+                            + "cpu_ratio=%.2f encode_ms=%d total_ms=%d cpu_ms=%d latency_ms=%d mpixels_por_s=%.3f",
+                    id, method, client, input.getWidth(), input.getHeight(), pixels, body.length, png.size(),
+                    inFlight, queueSize, queueMs, decodeMs, restoreMs, restoreCpuMs,
+                    restoreMs == 0 ? 0.0 : (double) restoreCpuMs / restoreMs, encodeMs, totalMs, cpuMs, latencyMs,
+                    restoreMs == 0 ? 0.0 : pixels / 1e6 / (restoreMs / 1000.0));
         } catch (Exception e) {
-            log("ERROR", "req=%d %s /restore client=%s status=500 total_ms=%d erro=%s",
+            metrics.requestFailed();
+            Log.error("req=%d %s /restore client=%s status=500 total_ms=%d erro=%s",
                     id, method, client, elapsedMs(start), e);
             e.printStackTrace();
             sendError(exchange, 500, "erro interno");
@@ -97,13 +149,9 @@ public class ImageRestorationServer {
     }
 
     private static void logRejected(long id, String method, String client, int status, String reason, long start) {
-        log("WARN", "req=%d %s /restore client=%s status=%d motivo=\"%s\" total_ms=%d",
+        metrics.requestRejected();
+        Log.warn("req=%d %s /restore client=%s status=%d motivo=\"%s\" total_ms=%d",
                 id, method, client, status, reason, elapsedMs(start));
-    }
-
-    private static void log(String level, String format, Object... args) {
-        System.out.printf("%s %-5s [%s] %s%n", LocalDateTime.now().format(TIMESTAMP), level,
-                Thread.currentThread().getName(), String.format(format, args));
     }
 
     private static long elapsedMs(long startNanos) {

@@ -1,3 +1,4 @@
+
 services:
   image-restoration:
     build: .
@@ -13,9 +14,7 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    command: tunnel --no-autoupdate --url http://image-restoration:8080
     restart: unless-stopped
     depends_on:
       - image-restoration

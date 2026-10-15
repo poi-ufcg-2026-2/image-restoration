@@ -1,0 +1,11 @@
+services:
+  image-restoration:
+    build: .
+    container_name: image-restoration
+    ports:
+      - "8081:8080"
+    environment:
+      PORT: "8080"
+      THREADS: "4"
+      METRICS_INTERVAL_S: "5"
+    restart: unless-stopped

@@ -18,7 +18,9 @@ Requer apenas o JDK 17+ (`sudo apt install openjdk-21-jdk-headless`). Não usa b
 Variáveis opcionais: `PORT` (padrão 8080), `THREADS` (requisições processadas em paralelo; padrão = nº de CPUs)
 e `METRICS_INTERVAL_S` (intervalo do log de métricas; padrão 5, `0` desativa).
 
-## Endpoint
+## Endpoints
+
+`GET /` — página HTML para enviar uma imagem pelo navegador e comparar a original com a restaurada.
 
 `POST /restore` — restaura a imagem enviada no corpo (até 10 MB) e devolve um PNG com o cabeçalho
 `X-Processing-Time-Ms`. Outros métodos recebem `405`.

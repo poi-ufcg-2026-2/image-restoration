@@ -21,7 +21,8 @@ import javax.imageio.ImageIO;
 /**
  * Backend HTTP para restauração de imagens (perfil CPU-bound).
  *
- * Endpoint:
+ * Endpoints:
+ *   GET  /         -> página HTML para enviar uma imagem e ver o resultado
  *   POST /restore  -> restaura a imagem enviada no corpo e devolve o PNG
  */
 public class ImageRestorationServer {
@@ -38,6 +39,65 @@ public class ImageRestorationServer {
 
     private static Metrics metrics;
 
+    private static final byte[] INDEX_HTML = """
+            <!DOCTYPE html>
+            <html lang="pt-BR">
+            <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Image Restoration</title>
+            <style>
+              body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+              .imgs { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1rem; }
+              figure { flex: 1 1 300px; margin: 0; }
+              figure img { max-width: 100%; border: 1px solid #ccc; }
+              #status { margin-top: 1rem; }
+            </style>
+            </head>
+            <body>
+            <h1>Image Restoration</h1>
+            <p>Restaura imagens borradas com o algoritmo de Richardson-Lucy (até 10 MB).</p>
+            <form id="form">
+              <input type="file" id="file" accept="image/*" required>
+              <button type="submit">Restaurar</button>
+            </form>
+            <div id="status"></div>
+            <div class="imgs">
+              <figure><figcaption>Original</figcaption><img id="original" alt=""></figure>
+              <figure><figcaption>Restaurada</figcaption><img id="restored" alt=""></figure>
+            </div>
+            <script>
+              const form = document.getElementById('form');
+              const status = document.getElementById('status');
+              const button = form.querySelector('button');
+              form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const file = document.getElementById('file').files[0];
+                if (!file) return;
+                document.getElementById('original').src = URL.createObjectURL(file);
+                document.getElementById('restored').removeAttribute('src');
+                status.textContent = 'Processando...';
+                button.disabled = true;
+                try {
+                  const res = await fetch('/restore', { method: 'POST', body: file });
+                  if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.error || ('HTTP ' + res.status));
+                  }
+                  const blob = await res.blob();
+                  document.getElementById('restored').src = URL.createObjectURL(blob);
+                  status.textContent = 'Concluído em ' + res.headers.get('X-Processing-Time-Ms') + ' ms no servidor.';
+                } catch (err) {
+                  status.textContent = 'Erro: ' + err.message;
+                } finally {
+                  button.disabled = false;
+                }
+              });
+            </script>
+            </body>
+            </html>
+            """.getBytes(StandardCharsets.UTF_8);
+
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(env("PORT", "8080"));
         int threads = Integer.parseInt(env("THREADS", String.valueOf(Runtime.getRuntime().availableProcessors())));
@@ -49,6 +109,7 @@ public class ImageRestorationServer {
         metrics = new Metrics(pool);
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/", ImageRestorationServer::handleIndex);
         server.createContext("/restore", ImageRestorationServer::handleRestore);
         server.setExecutor(task -> {
             long queuedAt = System.nanoTime();
@@ -74,6 +135,26 @@ public class ImageRestorationServer {
                 port, threads, Runtime.getRuntime().availableProcessors(),
                 Runtime.getRuntime().maxMemory() / (1024 * 1024), metricsIntervalS,
                 threadBean.isCurrentThreadCpuTimeSupported(), System.getProperty("java.version"));
+    }
+
+    private static void handleIndex(HttpExchange exchange) throws IOException {
+        String method = exchange.getRequestMethod();
+        String path = exchange.getRequestURI().getPath();
+        String client = exchange.getRemoteAddress().getAddress().getHostAddress();
+
+        if (!path.equals("/")) {
+            sendError(exchange, 404, "nao encontrado");
+            Log.warn("%s %s client=%s status=404", method, path, client);
+            return;
+        }
+        if (!method.equals("GET")) {
+            exchange.getResponseHeaders().set("Allow", "GET");
+            sendError(exchange, 405, "metodo nao permitido");
+            Log.warn("%s / client=%s status=405", method, client);
+            return;
+        }
+        send(exchange, 200, "text/html; charset=utf-8", INDEX_HTML);
+        Log.info("%s / client=%s status=200", method, client);
     }
 
     private static void handleRestore(HttpExchange exchange) throws IOException {

@@ -1,0 +1,24 @@
+# Controle de versão
+.git/
+.gitignore
+
+# Arquivos compilados
+bin/
+*.class
+target/
+build/
+
+# Arquivos temporários
+*.tmp
+*.log
+*.swp
+*~
+
+# Arquivos de IDE
+.idea/
+.vscode/
+*.iml
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db

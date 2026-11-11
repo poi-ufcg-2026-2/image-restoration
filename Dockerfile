@@ -16,6 +16,18 @@ WORKDIR /app
 COPY --from=build /app/bin ./bin
 COPY images/ ./images/
 
+# Diretório para persistência dos logs
+RUN mkdir -p /logs
+VOLUME /logs
+
+# Configurações padrão da aplicação
+ENV PORT=8080
+ENV METRICS_INTERVAL_S=5
+
 EXPOSE 8080
 
-CMD ["java", "-cp", "bin", "ImageRestorationServer"]
+# Copia o script de inicialização
+COPY start.sh /app/start.sh
+
+# Executa o Java como processo principal
+CMD ["sh", "/app/start.sh"]
